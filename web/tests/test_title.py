@@ -12,6 +12,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -19,10 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from web import sdk as sdk_mod  # noqa: E402
 from web import title as title_mod  # noqa: E402
-from web.app import create_app  # noqa: E402
 from web.fake import DEFAULT_SCRIPT, FakeSession, FakeSessionFactory  # noqa: E402
 from web.runs import RunManager  # noqa: E402
-from web.tests.support import StreamingASGITransport  # noqa: E402
+from web.tests.support import StreamingASGITransport, make_test_app  # noqa: E402
 from web.tests.test_api import collect_sse, open_stream, wait_status  # noqa: E402
 
 
@@ -92,18 +92,8 @@ async def test_generate_title_failure_returns_none():
     assert await title_mod.generate_title("x", lambda sid=None: empty) is None
 
 
-def make_app(script=None):
-    return create_app(
-        session_factory=FakeSessionFactory(script=script if script is not None else DEFAULT_SCRIPT, delay=0.02),
-        heartbeat_interval=0.05,
-        list_sessions_fn=lambda: [],
-        scope_config="/nonexistent-scope.yaml",
-        state_path=tempfile.mkdtemp() + "/state.json",
-    )
-
-
 async def test_first_message_assigns_title_and_emits_event():
-    """首条消息 → 事件流出现 run.title_changed，摘要与 transcript 写回到位。
+    """首条消息 → 事件流出现 session.title_changed，摘要与 transcript 写回到位。
     标题会话经独立 title_factory（生产为隔离 cwd 配置，不落项目根 transcript）。"""
     title_script = [{"type": "result", "subtype": "success", "result": "「部署 nginx」"}]
     title_calls = []
@@ -113,41 +103,47 @@ async def test_first_message_assigns_title_and_emits_event():
             title_calls.append(session_id)
             return FakeSession(script=title_script, session_id="sess_title")
 
-    app = create_app(
+    app = make_test_app(
         session_factory=FakeSessionFactory(script=DEFAULT_SCRIPT, delay=0.02),
         title_factory=TitleFactory(),
-        heartbeat_interval=0.05,
-        list_sessions_fn=lambda: [],
-        scope_config="/nonexistent-scope.yaml",
-        state_path=tempfile.mkdtemp() + "/state.json",
     )
     renames = []
+    rename_confirmations = []
     orig_rename = sdk_mod.rename_session
 
     def fake_rename(session_id, t, directory=None):
         renames.append((session_id, t))
+        run = next(iter(app.state.run_manager.runs.values()))
+        rename_confirmations.append(run.session_confirmed)
 
     sdk_mod.rename_session = fake_rename
     try:
         async with httpx.AsyncClient(transport=StreamingASGITransport(app=app), base_url="http://testserver") as client:
             run_id = (await client.post("/api/runs", json={})).json()["run_id"]
             await client.post(f"/api/runs/{run_id}/messages", json={"text": "部署 nginx 1.25 到 server-a"})
-            await wait_status(client, run_id, "WAITING_INPUT")
-            # collect_sse 的 1 秒窗内标题会话（无 delay）应已落流；偶发晚到再等一轮
-            events, _ = await collect_sse(await open_stream(client, run_id), deadline_s=1.0)
-            if not [e for e in events if e["event"] == "run.title_changed"]:
+            await wait_status(client, run_id, "READY")
+            # 快照即完（不再有整秒读窗）：标题事件通常回合中已落流，晚到小等一轮
+            events, _ = await collect_sse(await open_stream(client, run_id))
+            if not [e for e in events if e["event"] == "session.title_changed"]:
                 await asyncio.sleep(0.2)
-                events, _ = await collect_sse(await open_stream(client, run_id), deadline_s=1.0)
+                events, _ = await collect_sse(await open_stream(client, run_id))
             types = [e["event"] for e in events]
             # 标题事件在场（清洗剥掉了引号）
-            title_events = [e for e in events if e["event"] == "run.title_changed"]
+            title_events = [e for e in events if e["event"] == "session.title_changed"]
             assert len(title_events) == 1, types
             assert title_events[0]["data"]["title"] == "部署 nginx"
             # 摘要带 title 字段
             summary = (await client.get(f"/api/runs/{run_id}")).json()
             assert summary["title"] == "部署 nginx"
-        # transcript 写回：以部署会话的 session_id、清洗后的标题
-        assert renames == [("sess_fake_1", "部署 nginx")], renames
+        # transcript 写回：写回等 SDK 确认预分配身份（50ms 轮询）后才发生，
+        # 与快照读取是两条独立异步路径——小等收尾
+        for _ in range(50):
+            if renames:
+                break
+            await asyncio.sleep(0.02)
+        target = app.state.session_factory.starts[0].target_session_id
+        assert renames == [(target, "部署 nginx")], renames
+        assert rename_confirmations == [True], rename_confirmations
         assert title_calls == [None]  # 标题会话全新起、无续接
     finally:
         sdk_mod.rename_session = orig_rename
@@ -171,7 +167,8 @@ async def test_title_session_isolated_from_discovery():
 
 
 async def test_second_message_does_not_retitle():
-    """标题只生成一次：第二回合不再触发（无第二个标题会话）。"""
+    """标题只生成一次：第二回合不再触发（无第二个标题会话；回合连接按回合开合，
+    部署工厂每条指令各调一次）。"""
     deploy_calls = []
     title_calls = []
 
@@ -185,37 +182,34 @@ async def test_second_message_does_not_retitle():
             title_calls.append(session_id)
             return FakeSession(script=[{"type": "result", "subtype": "success", "result": "部署 nginx"}])
 
-    app = create_app(
+    app = make_test_app(
         session_factory=CountingFactory(script=DEFAULT_SCRIPT, delay=0.02),
         title_factory=TitleFactory(),
-        heartbeat_interval=0.05,
-        list_sessions_fn=lambda: [],
-        scope_config="/nonexistent-scope.yaml",
-        state_path=tempfile.mkdtemp() + "/state.json",
     )
-    async with httpx.AsyncClient(transport=StreamingASGITransport(app=app), base_url="http://testserver") as client:
-        run_id = (await client.post("/api/runs", json={})).json()["run_id"]
-        await client.post(f"/api/runs/{run_id}/messages", json={"text": "部署 nginx"})
-        await wait_status(client, run_id, "WAITING_INPUT")
-        await asyncio.sleep(0.2)  # 等标题会话（无 delay）跑完
-        await client.post(f"/api/runs/{run_id}/messages", json={"text": "继续"})
-        await wait_status(client, run_id, "WAITING_INPUT")
-        await asyncio.sleep(0.1)
-    # 部署会话 1 次（两回合同一连接）+ 标题会话 1 次；第二回合不再生成
-    assert len(deploy_calls) == 1 and len(title_calls) == 1, (deploy_calls, title_calls)
+    with patch.object(sdk_mod, "rename_session", lambda *_args, **_kwargs: None):
+        async with httpx.AsyncClient(transport=StreamingASGITransport(app=app), base_url="http://testserver") as client:
+            run_id = (await client.post("/api/runs", json={})).json()["run_id"]
+            await client.post(f"/api/runs/{run_id}/messages", json={"text": "部署 nginx"})
+            await wait_status(client, run_id, "READY")
+            await asyncio.sleep(0.2)  # 等标题会话（无 delay）跑完
+            await client.post(f"/api/runs/{run_id}/messages", json={"text": "继续"})
+            await wait_status(client, run_id, "READY")
+            await asyncio.sleep(0.1)
+    # 部署会话 2 次（按回合开合：每条指令各起新连接）+ 标题会话 1 次；
+    # 第二回合不再生成
+    assert len(deploy_calls) == 2 and len(title_calls) == 1, (deploy_calls, title_calls)
 
 
 async def test_continued_session_does_not_retitle():
-    """续聊不生成标题：重启恢复的老会话（first_prompt 非空、title 未生成过）
+    """续聊不生成标题：重启重放恢复的老会话（first_prompt 非空、title 未生成过）
     继续对话，不得把续聊指令总结成标题（「继续执行任务」类）——只有新对话
     的首条指令触发生成。"""
     state_dir = tempfile.mkdtemp()
     state_path = Path(state_dir) / "state.json"
-    state_path.write_text(json.dumps({"runs": [{
-        "run_id": "run_1", "status": "WAITING_INPUT", "stage": None,
-        "first_prompt": "部署 nginx", "title": None, "created_at": 1000.0,
-        "session_id": "sess_x", "resumed_from": None,
-    }]}, ensure_ascii=False), encoding="utf-8")
+    state_path.write_text(json.dumps(
+        {"ended_sessions": [], "sessions": {"run_1": "sess_x"}, "clone_sources": {}},
+        ensure_ascii=False,
+    ), encoding="utf-8")
     title_calls = []
 
     class TitleFactory:
@@ -230,20 +224,17 @@ async def test_continued_session_does_not_retitle():
     infos = [SimpleNamespace(session_id="sess_x", summary="部署 nginx", last_modified=9_950_000,
                              file_size=1, custom_title=None, first_prompt="部署 nginx",
                              git_branch=None, cwd=None, tag=None, created_at=1_000_000)]
-    app = create_app(
+    app = make_test_app(
         session_factory=FakeSessionFactory(script=DEFAULT_SCRIPT, delay=0.02),
         title_factory=TitleFactory(),
-        heartbeat_interval=0.05,
         list_sessions_fn=lambda: infos,
         get_session_messages_fn=lambda sid: two_turn_transcript(),
-        residual_cli_scan=lambda: [],
-        scope_config="/nonexistent-scope.yaml",
         state_path=str(state_path),
     )
     async with httpx.AsyncClient(transport=StreamingASGITransport(app=app), base_url="http://testserver") as client:
         assert (await client.get("/api/runs")).json()["runs"][0]["title"] is None
         await client.post("/api/runs/run_1/messages", json={"text": "继续之前的部署"})
-        await wait_status(client, "run_1", "WAITING_INPUT")
+        await wait_status(client, "run_1", "READY")
         await asyncio.sleep(0.2)
         summary = (await client.get("/api/runs/run_1")).json()
     assert title_calls == [], title_calls  # 续聊指令不起标题会话

@@ -11,7 +11,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from web.sdk import EXA_MCP_SERVER, SYSTEM_PROMPT, default_options  # noqa: E402
+from web.sdk import EXA_MCP_SERVER, SYSTEM_PROMPT, SessionStart, default_options  # noqa: E402
 
 
 def test_system_prompt_covers_control_boundary():
@@ -35,6 +35,39 @@ def test_options_pin_control_boundary():
     options = default_options()
     assert options.system_prompt == SYSTEM_PROMPT
     assert options.max_turns == 200
+
+
+def test_session_start_distinguishes_new_resume_and_fork():
+    """部署会话工厂的公开启动意图同时表达目标身份、上下文来源与 Fork。"""
+    target = "11111111-2222-4333-8444-555555555555"
+    source = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    fresh = SessionStart.fresh(target)
+    resumed = SessionStart.resume(target)
+    forked = SessionStart.fork(target, source)
+
+    assert (fresh.target_session_id, fresh.context_session_id, fresh.fork_session) == (
+        target, None, False,
+    )
+    assert (resumed.target_session_id, resumed.context_session_id, resumed.fork_session) == (
+        target, target, False,
+    )
+    assert (forked.target_session_id, forked.context_session_id, forked.fork_session) == (
+        target, source, True,
+    )
+
+    fresh_options = default_options(fresh)
+    resumed_options = default_options(resumed)
+    assert (fresh_options.session_id, fresh_options.resume, fresh_options.fork_session) == (
+        target, None, False,
+    )
+    assert (resumed_options.session_id, resumed_options.resume, resumed_options.fork_session) == (
+        None, target, False,
+    )
+    forked_options = default_options(forked)
+    assert (forked_options.session_id, forked_options.resume, forked_options.fork_session) == (
+        target, source, True,
+    )
 
 
 def test_options_grant_unattended_write_permission():

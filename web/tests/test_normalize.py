@@ -15,6 +15,7 @@ from claude_agent_sdk import (  # noqa: E402
     AssistantMessage,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -216,10 +217,12 @@ def test_to_dict_assistant_message():
         ],
         model="claude-x",
         parent_tool_use_id="parent-1",
+        session_id="11111111-2222-4333-8444-555555555555",
     )
     d = to_dict(msg)
     assert d["type"] == "assistant"
     assert d["parent_tool_use_id"] == "parent-1"
+    assert d["session_id"] == "11111111-2222-4333-8444-555555555555"
     assert [b["type"] for b in d["message"]["content"]] == ["thinking", "text", "tool_use"]
     # 适配后的形状直接可被 normalize 消费：四类块各归其位
     events = normalize_message(d, {})
@@ -258,9 +261,14 @@ def test_to_dict_result_message():
 
 
 def test_to_dict_partial_and_unknown_messages_are_inert():
-    # include_partial_messages 开启后的增量消息：适配为零形状，进不了事件流
+    # include_partial_messages 开启后的增量消息不进事件流，但其公开身份字段
+    # 仍供回合执行尽早确认预分配的目标身份。
     d = to_dict(StreamEvent(uuid="u", session_id="s", event={"type": "content_block_delta"}))
+    assert d == {"session_id": "s"}
     assert normalize_message(d, {}) == []
+    init = to_dict(SystemMessage(subtype="init", data={"session_id": "s-init"}))
+    assert init == {"session_id": "s-init"}
+    assert normalize_message(init, {}) == []
     assert normalize_message(to_dict(object()), {}) == []
 
 

@@ -15,7 +15,7 @@ import logging
 
 from . import sdk as sdk_mod
 from .redact import redact_text
-from .runs import RUNNING, TERMINAL
+from .runs import ENDED, RUNNING
 
 logger = logging.getLogger("web")
 
@@ -75,40 +75,40 @@ async def generate_title(user_text, session_factory):
 
 async def assign_title(run, user_text, session_factory, store, on_change=None):
     """run 的标题生成入口：新对话首条指令起生成，成功即落三处——
-    run.title（内存权威）、事件流 run.title_changed（前端即时改名）、
+    run.title（内存权威）、事件流 session.title_changed（前端即时改名）、
     transcript custom-title 行（重启 rebuild 找回）。
 
-    幂等：已有 title 或 run 已终态（生成期间被关闭）时不写；只对新对话
-    调用（调用方以 first_prompt 判定），续聊不再生成。session_id 在回合
-    Result 才提取，标题可能先到：写回 transcript 前等 session_id 就绪，
-    等不到（首回合即失败/关闭）只落内存。
+    幂等：已有 title 或 run 已终态（生成期间被结束）时不写；只对新对话
+    调用（调用方以 first_prompt 判定），续聊不再生成。session_id 虽在首回合
+    接受时已预分配，写回 transcript 前仍须等 SDK 消息确认身份，避免标题比
+    transcript 更早落下；等不到（首回合即失败/结束）只落内存。
     """
-    if run.title is not None or run.status in TERMINAL:
+    if run.title is not None or run.status == ENDED:
         return
     title = await generate_title(user_text, session_factory)
-    # 二次校验：生成期间可能已被命名（接续继承）或已关闭
-    if title is None or run.title is not None or run.status in TERMINAL:
+    # 二次校验：生成期间可能已被命名（克隆继承）或已结束
+    if title is None or run.title is not None or run.status == ENDED:
         return
     run.title = title
-    store.append(run.run_id, "run.title_changed", {"title": title})
+    store.append(run.run_id, "session.title_changed", {"title": title})
     if on_change is not None:
         on_change()
-    if run.session_id is None:
-        # 部署回合通常比标题会话慢得多，session_id 提取在前；极小窗口内
-        # 标题先到则等回合收尾（changed() 落簿记时 session_id 已提取）
-        await _wait_session_id(run)
-    if run.session_id is None:
-        return  # 首回合未完成即终止：transcript 无处写，内存与事件已落
+    if not run.session_confirmed:
+        await _wait_session_confirmation(run)
+    if not run.session_confirmed:
+        return  # 首回合身份未确认即终止：transcript 无法安全定位
     try:
         sdk_mod.rename_session(run.session_id, title, directory=str(sdk_mod.PROJECT_ROOT))
     except Exception:  # noqa: BLE001 —— transcript 写回失败只降级跨重启找回
         logger.warning("标题写回 transcript 失败（重启后回退截断标题）", exc_info=True)
 
 
-async def _wait_session_id(run, timeout_s=30.0):
-    """等 run.session_id 就绪或回合收尾（不再 RUNNING）。回合在 Result
-    处理中提取 session_id，随后状态回挂起——轮询此状态即可，无需新的
-    唤醒机制。"""
+async def _wait_session_confirmation(run, timeout_s=30.0):
+    """等 SDK 消息确认预分配身份或回合收尾（不再 RUNNING）。"""
     deadline = asyncio.get_running_loop().time() + timeout_s
-    while run.session_id is None and run.status == RUNNING and asyncio.get_running_loop().time() < deadline:
+    while (
+        not run.session_confirmed
+        and run.status == RUNNING
+        and asyncio.get_running_loop().time() < deadline
+    ):
         await asyncio.sleep(0.05)

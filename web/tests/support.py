@@ -1,12 +1,52 @@
-"""测试基建：支持真流式的 ASGI 传输。
+"""测试基建：安全应用装配与支持真流式的 ASGI 传输。
 
 httpx 自带的 ASGITransport 会把整个响应体收完才返回，SSE 这种
 挂起会话上的无限流会挂死；这里换成边推边读——响应体块进 asyncio.Queue，
 响应对象以异步迭代器消费，aclose 时取消应用协程（等效客户端断开）。
 """
 import asyncio
+import tempfile
+from pathlib import Path
 
 import httpx
+
+from web.app import create_app
+from web.fake import FakeSessionFactory
+
+
+TEST_HEARTBEAT = 0.05
+
+
+def make_test_app(*, session_factory=None, title_factory=None, **overrides):
+    """用完全本地的安全默认依赖装配 Web 应用。
+
+    部署与标题各用一套可独立观察的假会话；历史、transcript 时刻和残留
+    CLI 扫描默认均为空。每个应用拥有自己的临时 state 与空凭据配置。
+    专门测试某条边界时可通过同名参数显式覆盖。
+    """
+    test_directory = tempfile.TemporaryDirectory(prefix="auto-image-web-test-")
+    test_root = Path(test_directory.name)
+    scope_config = test_root / "scope.yaml"
+    scope_config.write_text("{}\n", encoding="utf-8")
+    deployment = session_factory if session_factory is not None else FakeSessionFactory()
+    titles = title_factory if title_factory is not None else FakeSessionFactory(script=[])
+    options = {
+        "session_factory": deployment,
+        "title_factory": titles,
+        "heartbeat_interval": TEST_HEARTBEAT,
+        "list_sessions_fn": lambda: [],
+        "get_session_messages_fn": lambda _session_id: [],
+        "transcript_times_fn": lambda _session_id: {},
+        "residual_cli_scan": lambda: [],
+        "scope_config": scope_config,
+        "state_path": test_root / "state.json",
+    }
+    options.update(overrides)
+    app = create_app(**options)
+    app.state.title_factory = titles
+    app.state.test_root = test_root
+    app.state.test_directory = test_directory
+    return app
 
 
 def async_client(app):

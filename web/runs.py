@@ -1,25 +1,28 @@
-"""Run 状态机与并发规则。
+"""会话状态机与并发规则（三态：READY / RUNNING / ENDED）。
 
-RUNNING 至多一个：新建会话、向挂起会话发指令都要求当前无会话在执行；
-WAITING_INPUT（挂起）的会话可多个并存。回合与会话分离：回合完成、被停止
-或部署失败都不结束会话，会话只能被用户关闭（CANCELED）或异常终止（FAILED）。
+会话（Session）与回合（Turn）分离：回合是用户指令的一次执行，会话是对话
+身份。回合完成（turn.completed）、被停止（turn.stopped）或失败
+（turn.failed）都不结束会话——一律回 READY，下一条指令即续聊；会话终态
+只有用户显式结束（end → ENDED，不可续聊只能克隆，墓碑入册防重启复活）。
+重启恢复（rebuild.py）全量重放 transcript，墓碑会话重放后仍标 ENDED。
 
-ENDED 是重启找回的历史 run（见 rebuild.py）：上个进程生命周期的记录，
-可回看、可作为续接起点，但不接受干预——终态语义与 CANCELED / FAILED 一致。
-
-活跃 = RUNNING / WAITING_INPUT；干预端点（stop / messages / cancel）对
-非活跃（终态）run 一律拒绝（run_not_active）。
+并发：无全局门禁，任意多会话可同时各跑一个回合；执行中回合数由
+max_parallel 限制（WEB_MAX_PARALLEL_RUNS，send 时检查——新建、克隆不占
+执行名额）。409 判定值为本模块顶部常量（调用方以 Conflict.detail 透传）。
 """
 import asyncio
 import itertools
 import time
+import uuid
 
-WAITING_INPUT = "WAITING_INPUT"
+READY = "READY"
 RUNNING = "RUNNING"
-CANCELED = "CANCELED"
-FAILED = "FAILED"
 ENDED = "ENDED"
-TERMINAL = {CANCELED, FAILED, ENDED}
+
+TURN_IN_PROGRESS = "turn_in_progress"
+SESSION_RUNNING = "session_running"
+PARALLEL_LIMIT_REACHED = "parallel_limit_reached"
+SESSION_NOT_ACTIVE = "session_not_active"
 
 
 class Conflict(Exception):
@@ -33,21 +36,21 @@ class Conflict(Exception):
 class Run:
     def __init__(self, run_id):
         self.run_id = run_id
-        self.status = WAITING_INPUT
+        self.status = READY
         self.stage = None
         self.created_at = time.time()
         self.first_prompt = None
         self.title = None            # LLM 生成标题（title.py），列表展示优先于截断
-        self.pending_prompt = None
-        self.next_input = asyncio.Event()
-        self.session = None
-        self.task = None
-        self.session_id = None        # SDK 会话 id（回合 Result 提取，resume_from 用）
-        self.resume_session_id = None  # 创建时携带的续接源会话 id（工厂参数）
-        self.resumed_from = None      # 续接来源 run_id（对外呈现）
-        self.stop_requested = False   # 停止请求标记：run_agent 在回合收尾消费
-        self.ended_at = None          # 终态时刻（历史回看的时长上限；非终态为 None）
-        self.last_event_at = None     # 最后活动时刻（时长冻结点；rebuild 以 ended_at 兜底）
+        self.turn_task = None        # 当前回合的 asyncio.Task（READY 时为 None）
+        self.session = None          # 当前回合的 SDK 连接（回合内非空）
+        self.session_id = None       # 本会话拥有的 SDK id（首回合接受时预分配）
+        self.session_confirmed = False  # SDK 消息已回报并确认上述目标身份
+        self.resume_session_id = None  # 回合起连接时的续接源（克隆/恢复带入）
+        self.resumed_from = None     # 克隆来源 run_id（对外呈现）
+        self.clone_source = None     # 克隆血缘（落克隆链镜像用，见 app.persist）
+        self.stop_requested = False  # 停止请求标记：turn.stopped 的权威判定
+        self.ended_at = None         # ENDED 时刻（时长定格；非终态为 None）
+        self.last_event_at = None    # 最后活动时刻（时长冻结点；rebuild 兜底）
 
     def summary(self):
         return {
@@ -64,15 +67,16 @@ class Run:
 
 
 class RunManager:
-    def __init__(self):
+    def __init__(self, max_parallel=10):
         self.runs = {}
         self._ids = itertools.count(1)
+        self.max_parallel = max_parallel
 
     def get(self, run_id):
         return self.runs.get(run_id)
 
     def register(self, run):
-        """注册重启重建的历史 run（不经 create 的并发校验：启动时无执行）。"""
+        """注册重启恢复的 run（不经 create 的并发校验：启动时无执行）。"""
         self.runs[run.run_id] = run
 
     def adopt_ids(self, run_ids):
@@ -87,58 +91,76 @@ class RunManager:
             self._ids = itertools.count(top + 1)
 
     def summaries(self):
-        """全部 run 摘要，最后活跃在前：终态按结束时刻（重建 run 即
-        transcript 的 last_modified，续接过一次的会话浮到最新），活跃按
-        创建时刻（无结束时刻）。"""
-        return [r.summary() for r in sorted(self.runs.values(), key=lambda r: r.ended_at or r.created_at, reverse=True)]
+        """全部 run 摘要，按最后活动及稳定次键降序排列。"""
+        def sort_key(run):
+            activity_at = run.last_event_at
+            if activity_at is None:
+                activity_at = run.ended_at
+            if activity_at is None:
+                activity_at = run.created_at
+            return activity_at, run.created_at, run.run_id
 
-    def running(self):
-        return next((r for r in self.runs.values() if r.status == RUNNING), None)
+        return [
+            run.summary()
+            for run in sorted(self.runs.values(), key=sort_key, reverse=True)
+        ]
 
-    def create(self, resume_from=None):
-        """新建空会话；resume_from 指向终态 run 时携带其 session_id 续接
-        （run 的存在性由调用方先行判定，此处只校验终态）。"""
-        if self.running() is not None:
-            raise Conflict("deployment_in_progress")
-        source = None
-        if resume_from is not None:
-            source = self.runs[resume_from]
-            if source.status not in TERMINAL:
-                raise Conflict("session_in_use")
+    def running_count(self):
+        """执行中回合数（并发上限的计数口径）。"""
+        return sum(1 for r in self.runs.values() if r.status == RUNNING)
+
+    def create(self):
+        """新建空会话（不占执行名额、不受并发上限约束）。"""
         run = Run(f"run_{next(self._ids)}")
-        if source is not None:
-            run.resumed_from = source.run_id
-            run.resume_session_id = source.session_id
-            # 任务名继承源头最早标题：接续会话与源是同一任务的延续，
-            # 不随接续后的首条新消息改名（intervene 只对无名 run 命名）
-            run.first_prompt = source.first_prompt
-            run.title = source.title
         self.runs[run.run_id] = run
         return run
 
-    def intervene(self, run, text=None):
-        """干预：本会话回合执行中先请求停止；text 给定时随后投递。
+    def begin_turn(self, run, text):
+        """回合开卷的前置校验与状态置位（同步块，与回合收尾互斥）：ENDED
+        拒发、执行中拒发、并发上限拒发；通过则置 RUNNING、记首条指令。
+        连接的建立由调用方随后起回合任务执行。"""
+        if run.status == ENDED:
+            raise Conflict(SESSION_NOT_ACTIVE)
+        if run.status == RUNNING:
+            raise Conflict(TURN_IN_PROGRESS)
+        if self.running_count() >= self.max_parallel:
+            raise Conflict(PARALLEL_LIMIT_REACHED)
+        if run.session_id is None:
+            # SDK 的 --session-id 只接受 UUID。必须在异步回合任务启动及本次
+            # 状态落盘前分配，Result 尚未返回时结束也能留下身份映射与墓碑。
+            run.session_id = str(uuid.uuid4())
+        run.status = RUNNING
+        # 上回合异常收尾未消费的停止标记作废：停止只作用于当时的回合
+        run.stop_requested = False
+        if run.first_prompt is None:
+            run.first_prompt = text
 
-        只同步完成状态与标记置位（与 run_agent 的回合收尾互斥、无交错），
-        打断动作（session.interrupt）由调用方在本方法返回后执行。
-        挂起且无 text 时无回合可停，幂等无操作。
-        """
-        if run.status in TERMINAL:
-            raise Conflict("run_not_active")
+    def request_stop(self, run):
+        """停止目标会话的当前回合：置 stop_requested（回合收尾以此判定
+        turn.stopped），打断动作由调用方随后执行。READY 会话无回合可停，
+        幂等无操作；ENDED 不可干预。"""
+        if run.status == ENDED:
+            raise Conflict(SESSION_NOT_ACTIVE)
         if run.status == RUNNING:
             run.stop_requested = True
-        elif text is None:
-            return
-        elif self.running() is not None:
-            raise Conflict("execution_in_progress")
-        if text is not None:
-            run.status = RUNNING
-            if run.first_prompt is None:
-                run.first_prompt = text
-            run.pending_prompt = text
-            run.next_input.set()
 
-    def cancel(self, run):
-        """关闭会话的前置校验；取消动作（task.cancel 与收尾）由调用方执行。"""
-        if run.status in TERMINAL:
-            raise Conflict("run_not_active")
+    def clone(self, run):
+        """克隆校验：READY / ENDED 源可克隆，RUNNING 源拒（resume 一个正在
+        被写入的 transcript，克隆回合会基于过时上下文执行云操作）。
+        新会话的构造（事件转录、标题继承）由调用方执行。"""
+        if run.status == RUNNING:
+            raise Conflict(SESSION_RUNNING)
+        new = self.create()
+        new.resumed_from = run.run_id
+        new.clone_source = run.run_id
+        new.resume_session_id = run.session_id  # 回合以此续接源起新连接
+        # 标题继承：克隆与源是同一任务的分叉，first_prompt 不再生成标题
+        new.first_prompt = run.first_prompt
+        new.title = run.title
+        return new
+
+    def end(self, run):
+        """显式结束会话的前置校验；在飞回合的取消与收尾由调用方执行。
+        已 ENDED 幂等拒绝（不可干预之外的一切动作）。"""
+        if run.status == ENDED:
+            raise Conflict(SESSION_NOT_ACTIVE)

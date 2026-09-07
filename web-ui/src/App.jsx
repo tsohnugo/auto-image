@@ -1,28 +1,29 @@
 // A 形态 —— Claude Code 会话的 Web 对话界面。
-// header（run_id · 会话状态 · 当前阶段 · 时长 · 结束会话）+ 左侧可收起
-// 任务详情栏（产物卡）+ 主区双 tab（会话 | 产物）
-// + 底部常驻对话输入条。多会话并存时 header 出现切换下拉。
+// header 全宽（run_id · 会话状态 · 当前阶段 · 时长 · 结束会话）+ 左侧可
+// 收起侧栏（「会话 | 产物」两面板）+ 主区混合标签栏（会话与产物文件同栏
+// 混排，只压主区）+ 编辑区（按激活标签页渲染消息流或文件内容）+ 底部
+// 常驻对话输入条。header 与输入条构成控制面，绑定最后激活的会话标签页
+// ——激活文件标签页不换对象。
 import { useEffect, useRef, useState } from 'react'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
 import './App.css'
 import * as store from './store.js'
-import { fmtActive, fmtLastActivity, firstPromptPreview, resumeMark, fmtSize, artifactTree, subtreeRels, defaultOpenPaths } from './derive.js'
+import { RUN_STATUS_LABEL, STAGE_LABEL, fmtActive, fmtLastActivity } from './derive.js'
+import { mdToHtml } from './markdown.js'
+import { tabKey } from './tabState.js'
+import ArtifactView from './components/ArtifactView.jsx'
 import ChatBar from './components/ChatBar.jsx'
+import Tabs from './components/Tabs.jsx'
+import SidePanel from './components/SidePanel.jsx'
 
-const STATUS_LABEL = { RUNNING: '执行中', WAITING_INPUT: '等待指令', CANCELED: '已关闭', FAILED: '失败', ENDED: '已结束' }
-// 下拉三态（执行中/挂起/已结束）：所有终态（含重启找回的 ENDED）归「已结束」
-const TASK_STATUS_LABEL = { RUNNING: '执行中', WAITING_INPUT: '挂起' }
-const STAGE_LABEL = { GUIDE: '生成指南', INSTALL: '远程安装', VERIFY: '只读验证', ARCHIVE: '打包归档', BUILD: 'RPM 构建' }
-const STATUS_TONE = { RUNNING: 'running', FAILED: 'bad', CANCELED: 'warn', ENDED: 'warn' }
+const STATUS_TONE = { RUNNING: 'running', ENDED: 'warn' }
 
 // 回合汇总与最后一条 agent 消息同文时降级为轻量状态线：正常完成的回合
 // result 就是最后一条 assistant 文本（CLI Result 语义），重复成框是噪音；
 // 异常收尾（无最终文本 / 被停止 / 失败摘要）才保留汇总框。
-// 线上不断言「可继续」——活会话输入条已表达，历史回放里则与只读语义相悖
+// 线上不断言「可继续」——活会话输入条已表达，只读回放里则与语义相悖
 function turnCompletedRow(ev, prev) {
   const result = String(ev.payload.result ?? '').trim()
-  if (!result) return null // 空结果（重启重建的历史常见）不成空框
+  if (!result) return null // 空结果（重放的历史常见）不成空框
   const dup =
     prev?.type === 'agent.message' &&
     String(prev.payload.text ?? '').trim() === result
@@ -95,23 +96,26 @@ function IoTodos({ todos }) {
 }
 
 function EventRow({ ev, prev, tools }) {
-  if (ev.type === 'resumed.history') {
-    return <div className="va-stage-line">─ 已接续 {ev.payload.resumed_from} · 以下为带入的历史 ─</div>
-  }
   if (ev.type === 'stage.changed') {
     return <div className="va-stage-line">─ 进入 {STAGE_LABEL[ev.payload.stage] ?? ev.payload.stage} ─</div>
   }
   if (ev.type === 'user.message') {
     return <div className="va-user">{ev.payload.text}</div>
   }
+  if (ev.type === 'turn.started') {
+    return null // 回合开卷标记（与 user.message 配对），消息行已表达
+  }
   if (ev.type === 'turn.stopped') {
     return (
       <div className="va-paused">
-        — 已停止（Esc 等效），等待指令 · 已提交的云操作不受停止影响，无法撤销 —
+        — 已停止，等待指令 · 已提交的云操作不受停止影响，无法撤销 —
       </div>
     )
   }
-  if (ev.type === 'run.interrupted') {
+  if (ev.type === 'turn.failed') {
+    return <div className="va-failed">回合失败（会话可继续）：{ev.payload.message}</div>
+  }
+  if (ev.type === 'turn.interrupted') {
     return (
       <div className="va-paused">
         — 服务重启，上一回合被中断 · 已提交的云操作不受影响，无法撤销 —
@@ -156,228 +160,65 @@ function EventRow({ ev, prev, tools }) {
   if (ev.type === 'turn.completed') {
     return turnCompletedRow(ev, prev)
   }
-  if (ev.type === 'run.failed') {
-    return <div className="va-failed">会话异常终止：{ev.payload.message}</div>
+  if (ev.type === 'session.started') {
+    return null // 会话流开卷，header 已表达
   }
-  if (ev.type === 'run.canceled') {
-    return <div className="va-canceled">— 会话已关闭 —</div>
+  if (ev.type === 'session.title_changed') {
+    return null // 标题落 header / 下拉，不在消息流渲染
   }
-  if (ev.type === 'run.ended') {
-    return <div className="va-canceled">— 历史会话回放完毕（重启找回，只读）—</div>
+  if (ev.type === 'session.ended') {
+    return <div className="va-canceled">— 会话已结束（可回看，只能 Fork）—</div>
   }
   return null
 }
 
-// 阶段徽标（产物文件行与产物 tab 头共用）
-function StageBadge({ stage }) {
-  return <span className={`va-art-badge s-${stage.toLowerCase()}`}>{stage}</span>
+// 结束会话：显式且不可逆，一律二次确认——READY 可能挂着一整天工作上下文，
+// 结束后只能 Fork；执行中结束还会打断在飞回合
+function onEndRun(run) {
+  const msg =
+    run.status === 'RUNNING'
+      ? `会话 ${run.runId} 回合执行中，结束将打断在飞回合（已提交的云操作不受影响）。确定结束？`
+      : `确定结束会话 ${run.runId}？结束后不可恢复（只读回看，只能 Fork 后继续）。`
+  if (!window.confirm(msg)) return
+  store.endRun()
 }
 
-// 目录树节点：目录行（箭头 + 三态勾选 + 目录名 + 子树文件数）+ 本目录文件
-// 行 + 子目录递归（缩进 + 竖参考线）。目录行勾选作用于子树全部文件（三态：
-// 全选 / 部分半选 / 无）；展开状态由父级 toggles 字典集中管理，未动过的
-// 目录落到 defaultOpen（最新一组所在路径自动展开）。
-function ArtDir({ node, toggles, setToggles, defaultOpen }) {
-  const s = store.useRunState()
-  const open = toggles[node.path] ?? defaultOpen.has(node.path)
-  const rels = subtreeRels(node)
-  const selCount = rels.reduce((n, p) => n + (s.artifactSel[p] ? 1 : 0), 0)
-  const allOn = rels.length > 0 && selCount === rels.length
-  const some = selCount > 0 && !allOn
-  const toggleOpen = () => setToggles({ ...toggles, [node.path]: !open })
-  return (
-    <div className="va-art-group">
-      <div
-        className="va-art-dir-head"
-        role="button"
-        tabIndex={0}
-        onClick={toggleOpen}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault()
-            toggleOpen()
-          }
-        }}
-        title={node.path}
-      >
-        <span className="va-art-dir-arrow">{open ? '▾' : '▸'}</span>
-        <input
-          type="checkbox"
-          className="va-art-check"
-          checked={allOn}
-          ref={(el) => {
-            if (el) el.indeterminate = some
-          }}
-          onChange={() => store.setArtifactSel(rels, !allOn)}
-          onClick={(e) => e.stopPropagation()}
-          title="勾选本目录（含子目录）全部文件"
-        />
-        <span className="va-art-name">{node.name}</span>
-        <span className="va-art-count" title="本目录（含子目录）文件数">{node.count}</span>
-      </div>
-      {open && (
-        <div className="va-art-children">
-          {node.files.map((f) => {
-            const rel = `${node.path}/${f.name}`
-            return (
-              <div
-                key={f.name}
-                role="button"
-                tabIndex={0}
-                className={`va-art-item${s.artifact?.dir === node.path && s.artifact?.name === f.name ? ' on' : ''}`}
-                onClick={() => store.openArtifact(rel, f)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') store.openArtifact(rel)
-                }}
-                title={f.name}
-              >
-                <input
-                  type="checkbox"
-                  className="va-art-check"
-                  checked={!!s.artifactSel[rel]}
-                  onChange={() => store.toggleArtifactSel(rel)}
-                  onClick={(e) => e.stopPropagation()}
-                />
-                {f.stage ? <StageBadge stage={f.stage} /> : null}
-                <span className="va-art-name">{f.name}</span>
-                <span className="va-art-size">{fmtSize(f.size)}</span>
-                <button
-                  className="va-art-dl"
-                  title="下载此文件"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    store.downloadArtifact(rel)
-                  }}
-                >
-                  ⤓
-                </button>
-              </div>
-            )
-          })}
-          {node.dirs.map((d) => (
-            <ArtDir key={d.path} node={d} toggles={toggles} setToggles={setToggles} defaultOpen={defaultOpen} />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
+// ---------- 侧栏宽度（拖拽调整，localStorage 持久化） ----------
 
-// 产物卡：deploy/ + rpm/ 全量镜像，目录树形态（服务端平铺分组派生成嵌套
-// 树，子目录按最新落盘在前），点击文件在主区产物 tab 查看。约定命名的带
-// 阶段徽标，非约定的（.v1 备份、杂项）无徽标平铺。每行可勾选（目录行/
-// 卡头可整棵子树全选），单文件 ⤓ 下载、勾选集一键打包 zip 下载。
-// 行与目录头是 div 而非 button：内部还嵌复选框与下载按钮，交互件不嵌套。
-function ArtifactCard() {
-  const s = store.useRunState()
-  const groups = s.artifacts.groups
-  const [toggles, setToggles] = useState({})
-  const roots = artifactTree(groups)
-  const fileCount = roots.reduce((n, r) => n + r.count, 0)
-  const selCount = Object.keys(s.artifactSel).length
-  return (
-    <div className="va-card">
-      <div className="va-card-title">产物 · {fileCount}</div>
-      {fileCount > 0 && (
-        <div className="va-art-tools">
-          <button onClick={() => store.setArtifactSel(roots.flatMap(subtreeRels), true)}>
-            全选
-          </button>
-          <button onClick={() => store.clearArtifactSel()} disabled={selCount === 0}>
-            清空
-          </button>
-          <button
-            className="va-art-zip"
-            onClick={() => store.downloadArtifactZip()}
-            disabled={selCount === 0 || s.artifactZipping}
-            title="勾选的产物打包成一个 zip 下载"
-          >
-            {s.artifactZipping ? '打包中…' : `下载 zip${selCount ? ` (${selCount})` : ''}`}
-          </button>
-        </div>
-      )}
-      {roots.length === 0 && <div className="va-card-line">deploy/ · rpm/ 下暂无产物</div>}
-      {roots.map((r) => (
-        <ArtDir key={r.path} node={r} toggles={toggles} setToggles={setToggles} defaultOpen={defaultOpenPaths(groups)} />
-      ))}
-    </div>
-  )
-}
+const SIDE_W_KEY = 'va-side-w'
+export const SIDE_W_DEFAULT = 280
+const SIDE_W_MIN = 220
+const sideWMax = () => Math.round(window.innerWidth * 0.4) // 主区事件流是心脏，侧栏至多吃四成
+const clampSideW = (w) => Math.max(SIDE_W_MIN, Math.min(sideWMax(), w))
 
-// markdown → 消毒后 HTML 的单点：产物与消息流共用（内容都系 agent 转述
-// 外部文档/工具输出，同威胁模型，HTML 一律消毒再进 DOM）
-const mdToHtml = (text) => DOMPurify.sanitize(marked.parse(text, { async: false }))
-
-// 产物 tab：markdown 经 marked 渲染（表格/代码块/验证契约 blockquote），json 原文展示
-function ArtifactView() {
-  const artifact = store.useRunState().artifact
-  if (!artifact) {
-    return <div className="artifact-empty">点击左侧产物卡中的文件查看</div>
+function readSideW() {
+  try {
+    const raw = localStorage.getItem(SIDE_W_KEY)
+    if (raw != null) {
+      const v = Number(raw)
+      // Number(null) 是 0——先判 null 再转换，缺失时落默认宽而非最小宽
+      if (Number.isFinite(v)) return clampSideW(v) // 窗口变小后恢复时按当前视口收敛
+    }
+  } catch {
+    // 存储不可用：用默认宽，不影响功能
   }
-  const isJson = artifact.name.endsWith('.json')
-  const html = isJson ? '' : mdToHtml(artifact.content)
-  const rel = artifact.dir ? `${artifact.dir}/${artifact.name}` : artifact.name
-  return (
-    <div className="va-artifact">
-      <div className="va-artifact-head">
-        {artifact.stage && <StageBadge stage={artifact.stage} />}
-        <span className="va-artifact-name">{artifact.name}</span>
-        <span className="va-artifact-dir">{artifact.dir}</span>
-        <button
-          className="va-artifact-dl"
-          onClick={() => store.downloadArtifact(rel)}
-          title="下载此文件"
-        >
-          ⤓ 下载
-        </button>
-      </div>
-      {isJson ? (
-        <pre className="va-artifact-raw">{artifact.content}</pre>
-      ) : artifact.binary ? (
-        <div className="va-artifact-binary">
-          <div className="va-artifact-binary-icon">📦</div>
-          <div className="va-artifact-binary-name">{artifact.name}</div>
-          <div className="va-artifact-binary-size">
-            二进制产物{artifact.size ? ` · ${fmtSize(artifact.size)}` : ''}，不支持在线预览
-          </div>
-          <button className="va-artifact-binary-dl" onClick={() => store.downloadArtifact(rel)}>
-            ⤓ 下载此文件
-          </button>
-        </div>
-      ) : (
-        <div className="va-artifact-md va-md" dangerouslySetInnerHTML={{ __html: html }} />
-      )}
-    </div>
-  )
+  return SIDE_W_DEFAULT
 }
 
-// 任务详情侧栏：产物卡（阶段与回合汇总常驻 header 与消息流，不重复设卡）。
-// 开合是一枚钮（PinToggle，渲染于 App 内），本组件只承载内容
-function TaskSide({ run }) {
-  return (
-    <aside className="va-side" id="task-side">
-      <div className="va-side-head">
-        <span className="va-side-title-text">任务详情</span>
-      </div>
-      <div className="va-side-cards">
-        <ArtifactCard />
-        {run?.status === 'CANCELED' && (
-          <div className="va-card"><div className="va-card-title">会话已关闭</div>云上已提交的操作不受影响</div>
-        )}
-      </div>
-    </aside>
-  )
+function persistSideW(w) {
+  try {
+    localStorage.setItem(SIDE_W_KEY, String(w))
+  } catch {
+    // 存储不可用：只丢宽度存活，不影响使用
+  }
 }
 
-export default function App() {
-  const s = store.useRunState()
-  const run = store.useViewRun()
+// 消息流：激活的会话标签页的事件渲染。ref/scroll 逻辑属主在本层，
+// 组件随标签页切换重挂（key=runId），follow 态自然复位
+function Stream({ run }) {
   const scrollRef = useRef(null)
   const [follow, setFollow] = useState(true)
-  const [sideOpen, setSideOpen] = useState(true)
-  const [tab, setTab] = useState('chat') // chat | artifact
-  const artifactCount = s.artifacts.groups.reduce((n, g) => n + g.files.length, 0)
-  const tools = run ? toolIndex(run.events) : { startedById: new Map(), finishedIds: new Set() }
+  const tools = toolIndex(run.events)
 
   const scrollToBottom = () => {
     const el = scrollRef.current
@@ -385,23 +226,8 @@ export default function App() {
   }
 
   useEffect(() => {
-    setTab('chat')
-    setFollow(true)
-  }, [s.viewRunId])
-
-  useEffect(() => {
     if (follow) scrollToBottom()
-  }, [run?.events.length, follow])
-
-  // 侧栏点开产物后自动切到产物 tab
-  useEffect(() => {
-    if (s.artifact) setTab('artifact')
-  }, [s.artifact?.dir, s.artifact?.name])
-
-  // 切回会话 tab（含从产物查看返回）时滚到最新
-  useEffect(() => {
-    if (tab === 'chat') scrollToBottom()
-  }, [tab, s.viewRunId])
+  }, [run.events.length, follow])
 
   const onScroll = () => {
     const el = scrollRef.current
@@ -409,103 +235,133 @@ export default function App() {
   }
 
   return (
+    <div className="va-stream" ref={scrollRef} onScroll={onScroll}>
+      {run.events.length === 0 && (
+        <div className="va-empty-hint">空会话——输入第一条部署指令（软件 + 文档链接 + 目标机器）。</div>
+      )}
+      {run.events.map((ev, i) => (
+        <EventRow key={ev.seq} ev={ev} prev={run.events[i - 1]} tools={tools} />
+      ))}
+      {!follow && (
+        <button
+          className="va-jump"
+          onClick={() => {
+            setFollow(true)
+            scrollToBottom()
+          }}
+        >
+          ↓ 回到最新
+        </button>
+      )}
+    </div>
+  )
+}
+
+export default function App() {
+  const s = store.useRunState()
+  const control = store.useControlRun()
+  const [sideOpen, setSideOpen] = useState(true)
+  const [sideW, setSideW] = useState(readSideW)
+  const dragRef = useRef(false)
+  const activeTab = s.tabs.find((t) => tabKey(t) === s.activeKey) ?? null
+  const activeRun = activeTab?.kind === 'session' ? s.runs[activeTab.runId] : null
+  const activeArtifact = activeTab?.kind === 'file' ? s.artifactCache[activeTab.relPath] : null
+
+  // 拖把手：Pointer Events + setPointerCapture（触控板/触屏同路径）。拖拽中
+  // 禁 pin 钮的 left transition（否则钮滞后光标拖影）；pointerup 落定并
+  // 持久化。宽度写 --side-w 变量，.va-side 与 pin 钮定位同源引用。
+  const onHandlePointerDown = (e) => {
+    e.currentTarget.setPointerCapture(e.pointerId)
+    dragRef.current = true
+    document.body.classList.add('va-side-resizing') // 拖拽期全局光标 + 禁选中
+  }
+  const onHandlePointerMove = (e) => {
+    if (!dragRef.current) return
+    setSideW(clampSideW(e.clientX))
+  }
+  const onHandlePointerUp = (e) => {
+    if (!dragRef.current) return
+    dragRef.current = false
+    e.currentTarget.releasePointerCapture(e.pointerId)
+    document.body.classList.remove('va-side-resizing')
+    persistSideW(sideW)
+  }
+  // 双击把手回默认宽
+  const onHandleDoubleClick = () => {
+    setSideW(SIDE_W_DEFAULT)
+    persistSideW(SIDE_W_DEFAULT)
+  }
+  // 窗口缩放：超限宽度按当前视口收敛（拖拽上限 40vw 的动态半边）
+  useEffect(() => {
+    const onResize = () => setSideW((w) => clampSideW(w))
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  return (
     <div className="va-root">
       <header className="va-head">
-        {s.order.length > 1 && (
-          <select
-            className="va-task-select"
-            value={s.viewRunId ?? ''}
-            onChange={(e) => store.selectRun(e.target.value)}
-            title="切换查看会话（历史会话只读回放）"
-          >
-            {s.order.map((id) => (
-              <option key={id} value={id}>
-                {firstPromptPreview(s.runs[id])} · {id} · {TASK_STATUS_LABEL[s.runs[id].status] ?? '已结束'}
-                {resumeMark(s.runs[id], s.runs)}
-              </option>
-            ))}
-          </select>
-        )}
-        {run ? (
+        {control ? (
           <>
-            <span className="va-runid">{run.runId}</span>
-            <span className={`dot tone-${STATUS_TONE[run.status] ?? 'ok'}`} />
-            <span>{STATUS_LABEL[run.status]}</span>
-            {run.connection === 'reconnecting' && <span className="va-conn">连接断开，重连中（Last-Event-ID 续传）…</span>}
+            <span className="va-runid" title={control.title ?? undefined}>{control.runId}</span>
+            <span className={`dot tone-${STATUS_TONE[control.status] ?? 'ok'}`} />
+            <span>{RUN_STATUS_LABEL[control.status]}</span>
             <span className="va-spacer" />
-            <span className="va-stage">{run.stage ? STAGE_LABEL[run.stage] ?? run.stage : null}</span>
+            <span className="va-stage">{control.stage ? STAGE_LABEL[control.stage] ?? control.stage : null}</span>
             <span className="va-elapsed" title="累计执行：各回合之和，扣除等待输入">
-              总计时间：{fmtActive(run, s.now)}
+              总计时间：{fmtActive(control, s.now)}
             </span>
-            <span className="va-elapsed" title="最后一次用户发送消息的时刻">更新时间 {fmtLastActivity(run)}</span>
-            <button onClick={() => store.cancel()} disabled={!store.isActive(run.status)}>
+            <span className="va-elapsed" title="最后一次用户发送指令的时刻">最近指令 {fmtLastActivity(control)}</span>
+            <button className="va-end" onClick={() => onEndRun(control)} disabled={!store.isOperable(control.status)}>
               结束会话
             </button>
           </>
         ) : (
           <span className="va-runid">auto-image 部署会话</span>
         )}
+        {s.connection === 'reconnecting' && (
+          <span className="va-conn">事件流连接断开，重连中（恢复后自动追平）…</span>
+        )}
       </header>
 
-      <div className="va-body">
-        {sideOpen && <TaskSide run={run} />}
-        {run && (
-          <button
-            className={`va-side-pin${sideOpen ? ' open' : ''}`}
-            onClick={() => setSideOpen(!sideOpen)}
-            title={sideOpen ? '收起侧栏' : '展开侧栏'}
-            aria-label={sideOpen ? '收起侧栏' : '展开侧栏'}
-            aria-expanded={sideOpen}
-            aria-controls="task-side"
-          >
-            <span className="va-btn-sym" aria-hidden="true">{sideOpen ? '«' : '»'}</span>
-          </button>
+      <div className="va-body" style={{ '--side-w': `${sideW}px` }}>
+        {sideOpen && <SidePanel />}
+        {sideOpen && (
+          <div
+            className="va-side-resize"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="拖拽调整侧栏宽度（双击恢复默认）"
+            onPointerDown={onHandlePointerDown}
+            onPointerMove={onHandlePointerMove}
+            onPointerUp={onHandlePointerUp}
+            onDoubleClick={onHandleDoubleClick}
+          />
         )}
+        <button
+          className={`va-side-pin${sideOpen ? ' open' : ''}`}
+          onClick={() => setSideOpen(!sideOpen)}
+          title={sideOpen ? '收起侧栏' : '展开侧栏'}
+          aria-label={sideOpen ? '收起侧栏' : '展开侧栏'}
+          aria-expanded={sideOpen}
+          aria-controls="task-side"
+        >
+          <span className="va-btn-sym" aria-hidden="true">{sideOpen ? '«' : '»'}</span>
+        </button>
         <div className="va-main">
-          {!run ? (
-            <div className="empty-state">
-              <div className="big">未开始</div>
-              <div>点底部「+ 新建」创建会话，输入第一条部署指令</div>
-            </div>
-          ) : (
-            <>
-              <div className="va-tabs">
-                <button className={tab === 'chat' ? 'on' : ''} onClick={() => setTab('chat')}>会话</button>
-                <button
-                  className={tab === 'artifact' ? 'on' : ''}
-                  onClick={() => setTab('artifact')}
-                  disabled={artifactCount === 0}
-                >
-                  产物 · {artifactCount}
-                </button>
+          <Tabs />
+          <div className="va-tab-body" id="va-tab-body">
+            {activeTab === null ? (
+              <div className="empty-state">
+                <div className="big">未开始</div>
+                <div>点标签栏「+ 新建」创建会话，输入第一条部署指令</div>
               </div>
-              <div className="va-tab-body">
-                {tab === 'chat' ? (
-                  <div className="va-stream" ref={scrollRef} onScroll={onScroll}>
-                    {run.events.length === 0 && (
-                      <div className="va-empty-hint">空会话——输入第一条部署指令（软件 + 文档链接 + 目标机器）。</div>
-                    )}
-                    {run.events.map((ev, i) => (
-                      <EventRow key={ev.seq} ev={ev} prev={run.events[i - 1]} tools={tools} />
-                    ))}
-                    {!follow && (
-                      <button
-                        className="va-jump"
-                        onClick={() => {
-                          setFollow(true)
-                          scrollToBottom()
-                        }}
-                      >
-                        ↓ 回到最新
-                      </button>
-                    )}
-                  </div>
-                ) : (
-                  <ArtifactView />
-                )}
-              </div>
-            </>
-          )}
+            ) : activeTab.kind === 'file' ? (
+              <ArtifactView artifact={activeArtifact} onDownload={store.downloadArtifact} />
+            ) : activeRun ? (
+              <Stream key={activeRun.runId} run={activeRun} />
+            ) : null}
+          </div>
         </div>
       </div>
 

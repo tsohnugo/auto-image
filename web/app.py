@@ -1,16 +1,25 @@
-"""FastAPI 应用：创建会话 / 干预（停止·投递·关闭）/ SSE 事件流。
+"""FastAPI 应用：创建会话 / 发送·停止·克隆·结束 / SSE 事件流。
 
-错误统一走 HTTPException 默认响应体；SSE 的 id 即内部事件 seq，
-空闲时按 heartbeat_interval 发 `: ping` 注释行保活。
+错误统一走 HTTPException 默认响应体。事件通道两条：per-run 端点是纯
+快照——SSE 的 id 即内部事件 seq，按 Last-Event-ID 重放历史、重放完毕正常
+结束响应；全局流常驻广播全部会话的实时事件，空闲按 heartbeat_interval
+发 `: ping` 注释行保活。
 
-停止的执行动作（session.interrupt）在 intervene 置标记之后由 HTTP 层
-调用——标记与 run_agent 的回合收尾在单线程事件循环上互斥，interrupt
-晚于回合结束时停止目标已达成，无需把失败放大成错误。
+停止的执行动作（session.interrupt）在 request_stop 置标记之后由 HTTP 层
+调用；连接仍在建立时只保留停止意图，run_turn 会在 query 前消费。标记与
+回合收尾在单线程事件循环上互斥，interrupt 晚于回合结束时停止目标已达成，
+无需把失败放大成错误。
+
+end 的收尾序列（RUNNING 中）：end 校验 → 取消在飞回合任务（回合不补
+收尾事件）→ session.ended 作为流的最后一条事件 → 墓碑入册。快照端点
+不替前端判终态：session.ended 本身在历史里，重放完毕自然断开。
 """
 import asyncio
 import json
 import logging
+import os
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -26,9 +35,9 @@ from . import sdk as sdk_mod
 from . import state as state_mod
 from . import title as title_mod
 from .events import EventStore
-from .runs import RunManager
+from .runs import ENDED, RunManager
 from .sdk import SDKSessionFactory
-from .session import run_agent
+from .session import run_turn
 
 # 前端构建产物（vite build 输出），存在才挂载；开发时走 vite dev proxy
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parent.parent / "web-ui" / "dist"
@@ -43,29 +52,37 @@ DEFAULT_ARTIFACT_ROOTS = {
 DEFAULT_DEPLOY_CONFIG = Path(__file__).resolve().parent.parent / "deploy.config.yaml"
 # 运行时真实凭据源（ak/sk/ECS 密码值进脱敏已知清单，见 redact.load_scope_secrets）
 DEFAULT_SCOPE_CONFIG = Path(__file__).resolve().parent.parent / "scope.yaml"
-# 挂起会话的落盘簿记（服务重启恢复可聊；同一 HOME 下多实例共用一份）
+# 恢复簿记（墓碑 + 身份映射 + 克隆链镜像；同一 HOME 下多实例共用一份）
 DEFAULT_STATE_PATH = Path.home() / ".auto-image-web" / "state.json"
+# 并发上限（数执行中回合；新建、克隆、标题生成不占名额）
+DEFAULT_MAX_PARALLEL_RUNS = 10
 
 
 def create_app(session_factory=None, heartbeat_interval=15.0, static_dir=None,
                artifact_roots=None, deploy_config=None, scope_config=None,
-               list_sessions_fn=None, get_session_messages_fn=None, residual_cli_scan=None,
-    state_path=None, title_factory=None):
+               list_sessions_fn=None, get_session_messages_fn=None, transcript_times_fn=None,
+               residual_cli_scan=None,
+    state_path=None, title_factory=None, max_parallel_runs=None):
     """session_factory 可注入：生产为 ClaudeSDKClient 真实现（默认），
     测试注入按剧本推消息的假实现——注入边界即唯一测试缝。artifact_roots
     （根名 → 目录映射）与 deploy_config 同理注入（产物目录与文件名约定
     造桩用），默认项目根下。
     scope_config 为脱敏已知值清单的凭据源（测试传造桩，不载真实凭据）。
-
     list_sessions_fn / get_session_messages_fn 注入假历史（重启重建测试缝），
-    residual_cli_scan 注入残留 CLI 检测（pgrep 告警测试缝），默认生产实现。
+    transcript_times_fn 注入假时刻表（重放事件时刻透传的测试缝，形状
+    session_id → {uuid: epoch 秒}），residual_cli_scan 注入残留 CLI 检测
+    （pgrep 告警测试缝），默认生产实现。
     state_path 为簿记落盘路径（恢复测试缝），默认 HOME 下固定位置。
     title_factory 为标题生成会话工厂（测试缝；生产为独立 cwd 的隔离配置，
-    transcript 不落项目根、不进重启重建的发现层）。"""
+    transcript 不落项目根、不进重启恢复的发现层）。
+    max_parallel_runs 为并发上限（默认 WEB_MAX_PARALLEL_RUNS 环境变量，
+    缺省 10；测试注入收紧）。"""
     # 已知凭据值入脱敏清单（幂等；scope 缺失时只剩形状正则防线）
     redact_mod.load_scope_secrets(scope_config or DEFAULT_SCOPE_CONFIG)
     app = FastAPI(title="auto-image deploy web")
-    manager = RunManager()
+    limit = max_parallel_runs if max_parallel_runs is not None else int(
+        os.environ.get("WEB_MAX_PARALLEL_RUNS", DEFAULT_MAX_PARALLEL_RUNS))
+    manager = RunManager(max_parallel=limit)
     store = EventStore()
     store.bind_runs(manager.runs)
     factory = session_factory or SDKSessionFactory()
@@ -78,14 +95,23 @@ def create_app(session_factory=None, heartbeat_interval=15.0, static_dir=None,
     app.state.heartbeat_interval = heartbeat_interval
     state_file = Path(state_path) if state_path is not None else DEFAULT_STATE_PATH
 
+    # 克隆链镜像（session_id → 来源 run_id）：transcript 里没有克隆血缘，
+    # 簿记撤销后克隆链父指针无从找回——克隆挂 run.clone_source，persist 时
+    # （首回合接受并预分配 session_id 后）随身份映射一并入册；启动时播种
+    clone_sources = {}
+
     def persist():
-        """状态变更点统一落盘（全量原子替换，见 state.save_state）。"""
-        state_mod.save_state(manager.runs.values(), state_file)
+        """状态变更点统一落盘（墓碑 + 身份映射 + 克隆链镜像，全量原子替换，
+        见 state.save_state）。"""
+        for r in manager.runs.values():
+            if r.clone_source and r.session_id:
+                clone_sources[r.session_id] = r.clone_source
+        state_mod.save_state(manager.runs.values(), state_file, clone_sources)
 
     def maybe_assign_title(run, text, is_first):
         """新对话的首条指令到达即起标题生成（Codex 同构：不等回合完成）。
-        is_first 由调用方在 intervene 前快照（intervene 首条指令写
-        first_prompt，事后无法判定）——续聊/接续/重启恢复的老会话一律不再
+        is_first 由调用方在 begin_turn 前快照（begin_turn 首条指令写
+        first_prompt，事后无法判定）——续聊/克隆/重启恢复的老会话一律不再
         生成（否则续聊指令被总结成「继续执行任务」类标题）。"""
         if is_first:
             return asyncio.create_task(
@@ -93,27 +119,25 @@ def create_app(session_factory=None, heartbeat_interval=15.0, static_dir=None,
             )
         return None
 
-    # 服务重启语义：簿记里的挂起会话先恢复（可聊、resume 重建连接），CLI 侧
-    # transcript 再重建其余历史（只读回看 + 续接起点）；正在执行的任务不自动
-    # 重试（RUNNING 降级挂起 + run.interrupted 提示）；残留 CLI 子进程只告警
-    # 不杀（可能处于云操作中间态）
-    restored = rebuild_mod.restore_active_runs(
-        manager, store,
-        state_mod.load_state(state_file),
-        get_session_messages_fn or sdk_mod.project_session_messages,
-    )
-    if restored:
-        logging.getLogger("web").info("服务重启后恢复 %d 条挂起会话（可继续对话）", len(restored))
-        for run in restored:
-            run.task = asyncio.create_task(run_agent(run, factory, store, on_change=persist))
-    rebuilt = rebuild_mod.rebuild_history(
+    def start_turn(run, text):
+        """起回合任务（begin_turn 校验通过后调用）：按回合开合连接，
+        收尾即散；任务引用挂 run 供 stop / end 定向。"""
+        run.turn_task = asyncio.create_task(run_turn(run, text, factory, store, on_change=persist))
+
+    # 服务重启语义：全量 transcript 重放恢复所有会话（可续聊），state 簿记
+    # （墓碑 + 身份映射 + 克隆链镜像）叠加；未收尾回合补 turn.interrupted
+    # 提示，不自动重试；残留 CLI 子进程只告警不杀（可能处于云操作中间态）
+    bookkeeping = state_mod.load_state(state_file)
+    clone_sources.update(bookkeeping["clone_sources"])
+    restored = rebuild_mod.recover_sessions(
         manager, store,
         list_sessions_fn or sdk_mod.list_project_sessions,
         get_session_messages_fn or sdk_mod.project_session_messages,
-        skip_sessions={r.session_id for r in restored},
+        bookkeeping,
+        transcript_times=transcript_times_fn or sdk_mod.transcript_times,
     )
-    if rebuilt:
-        logging.getLogger("web").info("服务重启后找回 %d 条历史会话", len(rebuilt))
+    if restored:
+        logging.getLogger("web").info("服务重启后重放恢复 %d 条会话（可续聊）", len(restored))
     residual_pids = (residual_cli_scan or residual_cli_processes)()
     if residual_pids:
         logging.getLogger("web").warning(
@@ -127,26 +151,11 @@ def create_app(session_factory=None, heartbeat_interval=15.0, static_dir=None,
 
     @app.post("/api/runs")
     async def create_run(body: dict | None = None):
-        resume_from = (body or {}).get("resume_from")
-        if resume_from is not None and manager.get(resume_from) is None:
-            raise HTTPException(status_code=404, detail="run not found")
-        try:
-            run = manager.create(resume_from)
-        except runs_mod.Conflict as exc:
-            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        run = manager.create()
         store.create(run.run_id)
-        # 会话流同步开卷：run.started 先行；接续创建时带入源会话全部历史
-        # （CLI resume 的浏览体验），seq 重新编号、断点续传语义不变
-        store.append(run.run_id, "run.started", {})
-        if run.resumed_from is not None:
-            store.append(run.run_id, "resumed.history", {"resumed_from": run.resumed_from})
-            # 源流的生命周期事件不转录：源的起点/接续标记/收尾都不是新会话的
-            # 状态——终态收尾被前端当成本 run 的终态会关流判死，接续后无法续聊
-            store.adopt_history(
-                run.run_id, run.resumed_from,
-                skip_types={"run.started", "run.canceled", "run.failed", "run.ended", "resumed.history"},
-            )
-        run.task = asyncio.create_task(run_agent(run, factory, store, on_change=persist))
+        # 会话流同步开卷：session.started 先行（无历史转录——续接语义已由
+        # clone 承担，新建即全新会话）
+        store.append(run.run_id, "session.started", {})
         persist()
         return {"run_id": run.run_id, "status": run.status, "resumed_from": run.resumed_from}
 
@@ -160,45 +169,71 @@ def create_app(session_factory=None, heartbeat_interval=15.0, static_dir=None,
         text = (body or {}).get("text")
         if not isinstance(text, str) or not text.strip():
             raise HTTPException(status_code=422, detail="text required")
-        is_first = run.first_prompt is None  # 快照先于 intervene（它写 first_prompt）
+        is_first = run.first_prompt is None  # 快照先于 begin_turn（它写 first_prompt）
         try:
-            # 本会话执行中：intervene 先请求停止，本端点返回后执行打断
-            manager.intervene(run, text)
+            manager.begin_turn(run, text)
         except runs_mod.Conflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail) from exc
+        # 接受指令与开卷事件是同一个同步段：成功响应一旦返回，随后到达的
+        # stop 必然排在这两条事实之后，不依赖异步回合任务是否已获调度。
+        store.append(run.run_id, "turn.started", {})
+        store.append(run.run_id, "user.message", {"text": text})
         persist()
         maybe_assign_title(run, text, is_first)
-        await _interrupt_if_requested(run)
+        start_turn(run, text)
         return {"run_id": run.run_id, "status": run.status}
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str, body: dict | None = None):
         run = _get_run_or_404(manager, run_id)
-        text = (body or {}).get("text")
-        if text is not None and (not isinstance(text, str) or not text.strip()):
-            raise HTTPException(status_code=422, detail="text must be non-empty")
-        is_first = run.first_prompt is None and text is not None
         try:
-            manager.intervene(run, text)
+            manager.request_stop(run)
         except runs_mod.Conflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail) from exc
         persist()
-        maybe_assign_title(run, text, is_first)
         await _interrupt_if_requested(run)
         return {"run_id": run.run_id, "status": run.status}
 
-    @app.post("/api/runs/{run_id}/cancel")
-    async def cancel_run(run_id: str):
+    @app.post("/api/runs/{run_id}/clone")
+    async def clone_run(run_id: str):
         run = _get_run_or_404(manager, run_id)
         try:
-            manager.cancel(run)
+            new = manager.clone(run)
         except runs_mod.Conflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail) from exc
-        run.task.cancel()
+        store.create(new.run_id)
+        store.append(new.run_id, "session.started", {})
+        # 源流转录进新会话（seq 重新编号、ts 原样透传——实时事件的 ts 本就是
+        # 真实时刻）：生命周期事件不是新会话的状态——源的 session.ended 会被
+        # 前端当成本流终态关流判死，克隆后无法续聊
+        store.adopt_history(
+            new.run_id, run.run_id,
+            skip_types={"session.started", "session.ended"},
+        )
+        # 转录不是真实活动（与 rebuild「重放事件不是真实活动」同款手法）：
+        # 末活动时刻覆写为克隆操作时刻——刚点的克隆在列表排最前，归档历史
+        # 的「N 分钟前」归源会话自己显示
+        new.last_event_at = time.time()
+        persist()
+        return {"run_id": new.run_id, "status": new.status, "resumed_from": run.run_id}
+
+    @app.post("/api/runs/{run_id}/end")
+    async def end_run(run_id: str):
+        run = _get_run_or_404(manager, run_id)
         try:
-            await run.task  # 等收尾（run.canceled 已入事件流）再返回
-        except asyncio.CancelledError:
-            pass
+            manager.end(run)
+        except runs_mod.Conflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        if run.turn_task is not None:
+            run.turn_task.cancel()
+            try:
+                await run.turn_task  # 等取消收尾（回合不补事件）再写终态
+            except asyncio.CancelledError:
+                pass
+            run.turn_task = None
+        run.status = ENDED
+        run.ended_at = time.time()
+        store.append(run.run_id, "session.ended", {})
         persist()
         return {"run_id": run.run_id, "status": run.status}
 
@@ -254,22 +289,39 @@ def create_app(session_factory=None, heartbeat_interval=15.0, static_dir=None,
             headers={"Content-Disposition": f'attachment; filename="{name}"'},
         )
 
+    # per-run 事件端点收窄为纯快照：按 Last-Event-ID 重放历史（断点续传），
+    # 重放完毕正常结束响应——不常驻、无心跳、无 ENDED 关流判定（终态事件
+    # session.ended 本身在历史里，快照一次给完；实时事件由全局流续接）
     @app.get("/api/runs/{run_id}/events")
     async def event_stream(run_id: str, request: Request):
-        run = _get_run_or_404(manager, run_id)
+        _get_run_or_404(manager, run_id)  # 未知 run 404
         seen = _parse_last_event_id(request.headers.get("Last-Event-ID"))
 
         async def generate():
-            nonlocal seen
-            with store.subscribe(run_id) as flag:
+            for event in store.replay_from(run_id, seen):
+                yield _sse_chunk(event)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # 全局事件流：一条连接广播全部会话的实时事件（帧带 run_id），零连接
+    # 状态——无 Last-Event-ID 断点、无连接簿记、无 TTL，增量游标是流自身
+    # 的局部变量；连接前的事件不重放（历史由快照补），断线重连靠快照重拉
+    # + per-run seq 去重吸收。永不因会话终态主动关闭：终态后不再产事件，
+    # 天然静默，空闲按 heartbeat_interval 心跳保活
+    @app.get("/api/stream")
+    async def global_stream():
+        async def generate():
+            with store.subscribe_global() as flag:
+                cursor = store.broadcast_len()
                 while True:
                     flag.clear()
-                    for event in store.replay_from(run_id, seen):
-                        seen = event["seq"]
-                        yield _sse_chunk(event)
-                    # 终态且历史重放完毕：正常结束流
-                    if run.status in runs_mod.TERMINAL and store.is_complete(run_id, seen):
-                        return
+                    for event in store.broadcast_from(cursor):
+                        cursor += 1
+                        yield _broadcast_chunk(event)
                     try:
                         await asyncio.wait_for(flag.wait(), timeout=heartbeat_interval)
                     except asyncio.TimeoutError:
@@ -289,9 +341,9 @@ def create_app(session_factory=None, heartbeat_interval=15.0, static_dir=None,
 
 
 async def _interrupt_if_requested(run):
-    """执行 intervene 排队的打断。回合可能刚好已自然结束（停止目标视为
-    达成）、会话可能尚未建立（创建后立即干预的窗口），两种情形均跳过；
-    打断本身失败不改变服务端权威状态（回合如何收尾以事件流为准）。"""
+    """执行 request_stop 排队的打断。回合可能刚好已自然结束（停止目标视为
+    达成）、会话可能尚未建立（此时由回合在 query 前消费），两种情形均
+    无需报错；打断失败不改变服务端权威状态（回合如何收尾以事件流为准）。"""
     if not run.stop_requested or run.session is None:
         return
     try:
@@ -304,6 +356,19 @@ def _sse_chunk(event):
     # ts 随 payload 下发（前端时长的冻结点），seq 走 SSE id 维持断点续传
     data = json.dumps({**event["payload"], "ts": event["ts"]}, ensure_ascii=False)
     return f"id: {event['seq']}\nevent: {event['type']}\ndata: {data}\n\n"
+
+
+def _broadcast_chunk(event):
+    # 全局帧：run_id/seq/ts/type/payload 全量下发（seq 仍是 per-run seq，
+    # 客户端去重锚点）；无 id 行——断点语义不存在，重连靠快照重拉
+    data = json.dumps({
+        "run_id": event["run_id"],
+        "seq": event["seq"],
+        "ts": event["ts"],
+        "type": event["type"],
+        "payload": event["payload"],
+    }, ensure_ascii=False)
+    return f"event: {event['type']}\ndata: {data}\n\n"
 
 
 def _parse_last_event_id(value):

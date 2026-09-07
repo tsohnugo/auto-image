@@ -48,7 +48,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   gap: 8px;
   color: var(--ink-2);
 }
-.empty-state .big { font-size: 18px; color: var(--ink); }
+.empty-state .big { font-size: 17px; color: var(--ink); }
 .artifact-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--ink-3); flex: 1; }
 
 /* ---- 409 / 提交错误条 ---- */
@@ -72,7 +72,6 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .chat-bar input:disabled { background: var(--surface-dim); color: var(--ink-3); }
 .chat-bar button { border-color: var(--line); }
-.chat-new { flex-shrink: 0; color: var(--accent); border-color: var(--accent); }
 .chat-continue {
   flex-shrink: 0; background: var(--surface); border: 1px solid var(--line);
   border-radius: 8px; padding: 4px 12px; font-size: 12.5px; cursor: pointer;
@@ -80,8 +79,25 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .chat-continue:hover:not(:disabled) { border-color: var(--ink-2); }
 .chat-continue:disabled { color: var(--ink-3); cursor: default; }
-.chat-act { flex-shrink: 0; min-width: 96px; }
-.chat-act:disabled { color: var(--ink-3); }
+.chat-send { flex-shrink: 0; min-width: 96px; }
+.chat-send:disabled { color: var(--ink-3); }
+/* 作用对象胶囊：控制面输入作用于哪个会话的就地标识。窄态常显左缘
+   （点它切回该会话标签页）；宽态是激活文件标签页时输入位的替身——先
+   确认作用对象再输入 */
+.chat-target {
+  flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px;
+  max-width: 200px; padding: 4px 10px; font-size: 12.5px;
+  border-radius: 999px; background: var(--surface-dim);
+  color: var(--ink-2); white-space: nowrap;
+}
+.chat-target:hover:not(:disabled) { border-color: var(--ink-3); background: var(--surface-deep); }
+.chat-target .va-tab-dot { flex-shrink: 0; margin: 0; }
+.chat-target-name { overflow: hidden; text-overflow: ellipsis; }
+.chat-target.wide { flex: 1; max-width: none; justify-content: center; }
+.chat-target.wide .chat-target-name {
+  font-family: var(--sans); white-space: normal;
+  overflow: visible; text-overflow: clip;
+}
 
 /* ---- A 形态布局 ---- */
 .va-root { height: 100%; display: flex; flex-direction: column; background: var(--surface); position: relative; }
@@ -95,11 +111,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .va-stage { font-weight: 600; }
 .va-elapsed { font-family: var(--mono); color: var(--ink-2); }
 .va-conn { color: var(--warn); }
-.va-task-select {
-  font: inherit; font-size: 12.5px; border: 1px solid var(--line); border-radius: 6px;
-  padding: 3px 6px; background: var(--surface); color: var(--ink-2);
-  max-width: 280px; text-overflow: ellipsis;
-}
+/* 结束会话钮：不可逆操作，hover 提示危险权重（描边与文字转熔断红，
+   不引入红底实心形态） */
+.va-end:hover:not(:disabled) { color: var(--bad); border-color: var(--bad); background: var(--surface); }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .dot.tone-running { background: var(--accent); animation: va-pulse 1.2s infinite; }
@@ -107,6 +121,55 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .dot.tone-warn { background: var(--warn); }
 .dot.tone-bad { background: var(--bad); }
 @keyframes va-pulse { 50% { opacity: 0.35; } }
+
+/* ---- 混合标签栏（会话与产物文件同栏混排，只压主区）----
+   整栏一个横向滚动容器：标签 + 「+ 新建」+ 计数/提示一起滚；竖向锁定
+   （overflow-y: hidden，竖向滚动条永不出现）。滚轮转横向见 Tabs.jsx
+   的原生非被动监听 */
+.va-tabsbar {
+  display: flex; gap: 4px; align-items: center;
+  padding: 4px 12px 0; border-bottom: 1px solid var(--line); font-size: 12.5px;
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; flex-shrink: 0;
+}
+.va-tab {
+  display: inline-flex; gap: 6px; align-items: center;
+  padding: 5px 8px; border: 1px solid transparent; border-bottom: none;
+  border-radius: 6px 6px 0 0; cursor: pointer; white-space: nowrap;
+  color: var(--ink-2); max-width: 200px; flex-shrink: 0;
+}
+.va-tab:hover { background: var(--surface-dim); }
+.va-tab.on {
+  background: var(--surface); border-color: var(--line); color: var(--ink);
+  position: relative; top: 1px;
+}
+.va-tab-name { overflow: hidden; text-overflow: ellipsis; }
+.va-tab-dot { flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; }
+/* 文件标签页标识：文件图标（与状态点区分两类标签页），二进制产物换箱形 */
+.va-tab-ico { flex-shrink: 0; font-size: 12px; line-height: 1; }
+/* ● 执行中（呼吸）/ ○ 等待指令 / ◆ 最近回合失败 / ■ 已结束（title 另有状态词） */
+.va-tab-dot.running { background: var(--accent); animation: va-pulse 1.2s infinite; }
+.va-tab-dot.ready { background: transparent; border: 1.5px solid var(--ink-3); }
+.va-tab-dot.failed { background: var(--bad); transform: rotate(45deg); border-radius: 1px; }
+.va-tab-dot.ended { background: var(--ink-3); border-radius: 2px; }
+.va-tab-close {
+  flex-shrink: 0; border: none; background: none; padding: 0 2px;
+  font-size: 14px; line-height: 1; color: var(--ink-3); cursor: pointer; border-radius: 4px;
+}
+.va-tab-close:hover { color: var(--bad); background: var(--surface-dim); }
+.va-tab-close:disabled { color: var(--line); cursor: not-allowed; background: none; opacity: 1; }
+.va-tab-new {
+  flex-shrink: 0; border: 1px dashed var(--line); background: none;
+  border-radius: 6px; padding: 2px 10px; color: var(--accent); cursor: pointer;
+}
+.va-tab-new:hover { border-color: var(--accent); }
+.va-run-count {
+  flex-shrink: 0; font-family: var(--mono); color: var(--accent);
+  padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px;
+}
+.va-run-hint {
+  flex-shrink: 0; color: var(--warn); max-width: 320px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 .va-body { flex: 1; display: flex; min-height: 0; position: relative; }
 .va-main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
@@ -130,10 +193,10 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .va-tool { margin: 1px 0; font-size: 12px; }
 .va-tool summary {
   display: block; cursor: pointer; list-style: none; user-select: none;
-  color: var(--ink-3); padding: 1px 0 1px 20px;
+  color: var(--ink-2); padding: 1px 0 1px 20px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.va-tool summary b { font-weight: 600; }
+.va-tool summary b { font-weight: 600; color: var(--ink); }
 .va-tool summary::-webkit-details-marker { display: none; }
 /* 展开体：输入/输出各一块（浅底圆角块），限高内自滚动 */
 .va-tool-detail { margin: 2px 0 4px 20px; display: flex; flex-direction: column; gap: 6px; }
@@ -171,7 +234,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .va-thinking { margin: 2px 0; }
 .va-thinking summary {
-  cursor: pointer; list-style: none; color: var(--ink-3); font-size: 11.5px;
+  cursor: pointer; list-style: none; color: var(--ink-2); font-size: 11.5px;
   padding: 1px 0; user-select: none;
 }
 .va-thinking summary::-webkit-details-marker { display: none; }
@@ -193,49 +256,88 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   box-shadow: 0 2px 8px rgba(0,0,0,0.15);
 }
 
-/* ---- 任务详情侧栏 ---- */
+/* ---- 侧栏（「会话 | 产物」两面板） ---- */
+/* 宽度单源 --side-w：由 App 按 localStorage 恢复/拖拽写入（拖拽把手在右缘），
+   侧栏与 pin 钮骑缝位同源引用；默认 280px（变量缺失兜底，如首帧） */
 .va-side {
-  width: 280px; flex-shrink: 0; border-right: 1px solid var(--line);
+  width: var(--side-w, 280px); flex-shrink: 0; border-right: 1px solid var(--line);
   display: flex; flex-direction: column; min-height: 0; background: var(--surface);
-  overflow-y: auto;
 }
-.va-side-head {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 8px 8px 8px 12px; border-bottom: 1px solid var(--line);
-  position: sticky; top: 0; background: var(--surface);
+/* 面板小 tab：切换会话列表与产物树（默认产物，选择持久化 localStorage） */
+.va-side-tabs {
+  display: flex; gap: 4px; flex-shrink: 0;
+  padding: 8px 8px 0; border-bottom: 1px solid var(--line);
 }
-.va-side-title-text { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-3); }
+.va-side-tabs button {
+  border: none; background: none; border-radius: 6px 6px 0 0;
+  padding: 5px 10px; font-size: 12px; color: var(--ink-2);
+  border-bottom: 2px solid transparent;
+}
+.va-side-tabs button.on { color: var(--ink); font-weight: 600; border-bottom-color: var(--accent); }
+.va-side-tabs button:hover { background: var(--surface-dim); }
+/* 面板体：可滚动列表容器 */
+.va-side-panel {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 8px; display: flex; flex-direction: column; gap: 6px;
+}
+/* 面板容器（tabpanel 角色）：只做包裹层，滚动归面板体 */
+.va-side-panel-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.va-side-empty { color: var(--ink-3); font-size: 12.5px; padding: 6px 6px; }
+
+/* ---- 会话列表面板 ---- */
+/* 行是 div 而非 button：当前行需要整体高亮且可能含后续交互件 */
+.va-sess-row {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 5px 6px; border-radius: 6px; cursor: pointer;
+}
+.va-sess-row:hover { background: var(--surface-dim); }
+.va-sess-row.on { background: var(--surface-deep); }
+.va-sess-row.on .va-sess-name { font-weight: 600; }
+.va-sess-row .va-tab-dot { margin-top: 5px; }
+.va-sess-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.va-sess-title { display: flex; align-items: center; gap: 5px; min-width: 0; }
+/* 已开为标签页的弱标记：标题前一枚小点 */
+.va-sess-open { flex-shrink: 0; width: 6px; height: 6px; border-radius: 2px; background: var(--accent); }
+/* tab 序列里已开的会话不再另加蓝点（本身已在此），文件列表同款标记见 .va-art-opened */
+.va-sess-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px;
+}
+.va-sess-ago { flex-shrink: 0; color: var(--ink-3); font-size: 11px; font-family: var(--mono); }
+.va-sess-sub { color: var(--ink-3); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 侧栏开合 pin 钮：竖向把手形（窄宽、加高、pill 圆角），垂直居中、
-   随栏缘水平移动——展开时骑缝在 280px 栏界线上，收起时滑回主区左缘
-   贴边；图标随态换向（«/»），浮层带影分层 */
+   随栏缘水平移动——展开时骑缝在栏界线上，收起时滑回主区左缘贴边；
+   图标随态换向（«/»），描边分层（零阴影规则）。left 走 --side-w 同源
+   （拖宽后骑缝位跟随）；拖拽期 va-side-resizing 禁 transition 防拖影 */
 .va-side-pin {
-  position: absolute; top: 50%; left: 280px; z-index: 5;
+  position: absolute; top: 50%; left: var(--side-w, 280px); z-index: 5;
   transform: translate(-50%, -50%);
   display: inline-flex; align-items: center; justify-content: center;
   width: 14px; height: 44px; padding: 0; font-size: 12px;
   color: var(--ink-2); border-color: var(--line);
   background: var(--surface);
   border-radius: 999px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
   transition: left 0.18s ease;
 }
 .va-side-pin:not(.open) { left: 7px; }
+.va-side-resizing .va-side-pin { transition: none; }
+/* 拖拽把手：侧栏右缘 5px 竖条（透明，hover 显线提示可拖），pin 钮 z-index
+   更高压其上照常可点；双击回默认宽 */
+.va-side-resize {
+  position: absolute; top: 0; bottom: 0;
+  left: calc(var(--side-w, 280px) - 2.5px); width: 5px;
+  z-index: 4; cursor: col-resize; touch-action: none;
+}
+.va-side-resize:hover, .va-side-resize:active { background: var(--accent); opacity: 0.35; }
+/* 拖拽期：全局列光标 + 禁文本选中（指针掠过标签/标题时不闪烁） */
+.va-side-resizing { cursor: col-resize; user-select: none; }
+.va-side-resizing * { cursor: col-resize !important; }
 .va-side-pin:hover { background: var(--surface-dim); color: var(--ink); }
 .va-btn-sym { font-family: var(--mono); line-height: 1; }
-.va-side-cards { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
-.va-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--surface); display: flex; flex-direction: column; gap: 4px; }
-.va-card-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-3); }
-.va-card-big { font-size: 17px; font-weight: 700; }
-.va-card-line { font-size: 12.5px; color: var(--ink-2); }
+/* 产物面板头（原产物卡标题，去卡片边框后升为面板节标题） */
+.va-art-panel-head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-3); padding: 2px 6px; }
 
-/* ---- 主区 tabs ---- */
-.va-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); padding: 0 12px; flex-shrink: 0; }
-.va-tabs button {
-  border: none; background: transparent; border-radius: 6px 6px 0 0;
-  padding: 7px 14px; color: var(--ink-2); font-size: 13px; border-bottom: 2px solid transparent;
-}
-.va-tabs button.on { color: var(--ink); font-weight: 600; border-bottom-color: var(--accent); }
-.va-tabs button:disabled { opacity: 0.4; }
+/* ---- 主区编辑体（混合标签栏下方） ---- */
 .va-tab-body { flex: 1; min-height: 0; display: flex; }
 
 /* ---------- 产物：侧栏产物卡（目录树） ---------- */
@@ -269,6 +371,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .va-art-item:hover { background: var(--surface-dim); }
 .va-art-item.on { background: var(--surface-deep); font-weight: 600; }
 .va-art-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 已打开为文件标签页的标记：文件名右侧一枚蓝方点（复用会话列表标记的
+   语义：蓝 = 正在“发生”的视图占用） */
+.va-art-opened { flex-shrink: 0; width: 6px; height: 6px; border-radius: 2px; background: var(--accent); }
 .va-art-size { flex-shrink: 0; color: var(--ink-3); font-size: 11px; }
 /* 行内 / 组头勾选框与单文件下载按钮 */
 .va-art-check { flex-shrink: 0; margin: 0; accent-color: var(--accent); cursor: pointer; }

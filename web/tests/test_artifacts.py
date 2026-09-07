@@ -17,9 +17,8 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from web.app import create_app  # noqa: E402
 from web.fake import FakeSessionFactory  # noqa: E402
-from web.tests.support import async_client  # noqa: E402
+from web.tests.support import async_client, make_test_app  # noqa: E402
 
 # deploy.config.yaml 约定文件名的样例集（nginx 1.25 造桩）
 GUIDE_FILES = ("nginx-install.md", "nginx-verify.md")
@@ -80,13 +79,10 @@ def make_app(root):
     (root / "deploy.config.yaml").write_text(DEPLOY_CONFIG_STUB, encoding="utf-8")
     (root / "deploy").mkdir(exist_ok=True)
     (root / "rpm").mkdir(exist_ok=True)
-    return create_app(
+    return make_test_app(
         session_factory=FakeSessionFactory(script=[]),
-        heartbeat_interval=0.05,
         artifact_roots={"deploy": root / "deploy", "rpm": root / "rpm"},
         deploy_config=root / "deploy.config.yaml",
-        list_sessions_fn=lambda: [],  # 不读本机真实 transcript
-        scope_config=root / "scope-absent.yaml",  # 不载真实凭据（脱敏已知值清单隔离）
     )
 
 
